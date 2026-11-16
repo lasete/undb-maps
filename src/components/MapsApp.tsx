@@ -29,21 +29,29 @@ import { stopIndexOf } from "@/lib/streetview";
 import { useLayout, useNow, useReservations, useSettings, type Settings } from "@/lib/store";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
-import CampusMap, { type BuildingStats } from "./CampusMap";
-import DetailPanel, { type PanelTarget } from "./DetailPanel";
-import RoomList from "./RoomList";
-import Reservations from "./Reservations";
-import ARView from "./ARView";
-import StreetView from "./StreetView";
-import SettingsPanel from "./SettingsPanel";
-import IdleScreen from "./IdleScreen";
+import type { BuildingStats } from "./CampusMap";
+import type { PanelTarget } from "./DetailPanel";
 
 gsap.registerPlugin(useGSAP);
 
 const CampusScene = dynamic(() => import("./CampusScene"), {
   ssr: false,
-  loading: () => <div className="absolute inset-0 grid place-items-center bg-background text-sm text-muted-foreground">Carregando o campus…</div>,
+  loading: () => (
+    <div className="absolute inset-0 grid place-items-center overflow-hidden bg-background text-sm text-muted-foreground">
+      <Image src="/campus/satelite.jpg" alt="" fill priority sizes="100vw" className="object-cover opacity-35" />
+      <span className="relative rounded-full bg-card/95 px-4 py-2 shadow-lg">Preparando o mapa 3D…</span>
+    </div>
+  ),
 });
+
+const CampusMap = dynamic(() => import("./CampusMap"));
+const DetailPanel = dynamic(() => import("./DetailPanel"));
+const RoomList = dynamic(() => import("./RoomList"));
+const Reservations = dynamic(() => import("./Reservations"));
+const ARView = dynamic(() => import("./ARView"), { ssr: false });
+const StreetView = dynamic(() => import("./StreetView"));
+const SettingsPanel = dynamic(() => import("./SettingsPanel"));
+const IdleScreen = dynamic(() => import("./IdleScreen"), { ssr: false });
 
 type Tab = "mapa" | "salas" | "passeio" | "reservas" | "ra";
 type View = Settings["view"];
@@ -78,7 +86,7 @@ function useSystemDark() {
 }
 
 /** vidro: fundo translúcido + desfoque (só em elementos fixos/flutuantes) */
-const glass = "border border-border/70 bg-card/80 shadow-[0_10px_40px_-12px_rgba(18,10,16,.45)] backdrop-blur-xl";
+const glass = "map-glass border border-border/70 bg-card/95 shadow-[0_10px_40px_-12px_rgba(18,10,16,.45)]";
 
 export default function MapsApp({ variant }: { variant: "mobile" | "totem" }) {
   const totem = variant === "totem";
@@ -268,7 +276,7 @@ export default function MapsApp({ variant }: { variant: "mobile" | "totem" }) {
               )}
             </>
           )}
-          {tab === "salas" && <RoomList now={now} reservations={reservations} autoFocus={focusSearch} onRoom={(r) => openRoom(r)} />}
+          {tab === "salas" && <RoomList now={now} reservations={reservations} autoFocus={focusSearch} onRoom={(r: Room) => openRoom(r)} />}
           {tab === "reservas" && <Reservations now={now} reservations={reservations} onCancel={cancel} onFind={() => setTab("salas")} />}
           {tab === "passeio" && (
             <div className="absolute inset-0">
@@ -407,7 +415,7 @@ export default function MapsApp({ variant }: { variant: "mobile" | "totem" }) {
               totem={totem}
               onClose={() => setPanel(null)}
               onRoute={goRoute}
-              onRoom={(r) => openRoom(r)}
+              onRoom={(r: Room) => openRoom(r)}
               onMode={setPanelMode}
               onAddReservation={add}
               onGoReservations={() => {

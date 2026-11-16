@@ -24,13 +24,14 @@ const SEG_SPANS = SEG_IDS.map((s) => {
   return { id: s, first, count };
 });
 
-const glass = "border border-white/15 bg-[#120a10]/70 shadow-[0_10px_40px_-12px_rgba(0,0,0,.6)] backdrop-blur-xl";
+const glass = "border border-white/15 bg-[#120a10]/90 shadow-[0_10px_40px_-12px_rgba(0,0,0,.6)] desk:backdrop-blur-xl";
 
 export default function StreetView({ totem, start = 0 }: { totem: boolean; start?: number }) {
   const [i, setI] = useState(start);
   const [playing, setPlaying] = useState(false);
   const [places, setPlaces] = useState(false);
   const touch = useRef<number | null>(null);
+  const preload = useRef<HTMLImageElement | null>(null);
   const root = useRef<HTMLDivElement>(null);
   const stop = STOPS[i];
   const seg = SEGMENTS[stop.segment];
@@ -60,7 +61,15 @@ export default function StreetView({ totem, start = 0 }: { totem: boolean; start
   // pré-carrega a próxima foto
   useEffect(() => {
     const n = STOPS[i + 1];
-    if (n) new window.Image().src = n.file;
+    if (!n) return;
+    const image = new window.Image();
+    image.decoding = "async";
+    image.src = n.file;
+    preload.current = image;
+    return () => {
+      if (preload.current === image) preload.current = null;
+      image.src = "";
+    };
   }, [i]);
 
   // transição entre fotos: a nova entra com leve aproximação (como dar um passo)
@@ -88,9 +97,8 @@ export default function StreetView({ totem, start = 0 }: { totem: boolean; start
         touch.current = null;
       }}
     >
-      {/* foto + fundo desfocado (para telas largas) */}
-      <img src={stop.file} alt="" aria-hidden className="absolute inset-0 h-full w-full scale-110 object-cover opacity-40 blur-3xl" />
-      <img key={stop.file} data-photo src={stop.file} alt={stop.caption} className="absolute inset-0 m-auto h-full w-full object-contain" />
+      {/* Uma única superfície de foto: evita o segundo bitmap + blur em tela cheia. */}
+      <img key={stop.file} data-photo src={stop.file} alt={stop.caption} width={720} height={1280} decoding="async" className="absolute inset-0 m-auto h-full w-full object-cover desk:object-contain" />
       <div aria-hidden className="pointer-events-none absolute inset-0 bg-gradient-to-b from-black/55 via-transparent via-40% to-black/80" />
 
       {/* ─── topo ─────────────────────────────────────────────── */}
@@ -228,11 +236,12 @@ export default function StreetView({ totem, start = 0 }: { totem: boolean; start
                       }}
                       className="group relative flex aspect-[3/4] w-full flex-col justify-end overflow-hidden rounded-2xl p-3 text-left ring-1 ring-white/10"
                     >
-                      <img
+                      <Image
                         src={STOPS[idx].file}
                         alt=""
+                        fill
+                        sizes="(max-width: 640px) 33vw, 144px"
                         className="absolute inset-0 h-full w-full object-cover transition-transform duration-500 group-hover:scale-105"
-                        loading="lazy"
                       />
                       <span className="absolute inset-0 bg-gradient-to-t from-black/95 via-black/35 to-transparent" />
                       <span className="absolute top-2.5 left-2.5 h-1 w-6 rounded-full" style={{ background: color }} aria-hidden />

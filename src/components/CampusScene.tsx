@@ -557,11 +557,21 @@ interface Props {
   dark: boolean;
   onSelect: (id: BuildingId) => void;
   onBackground?: () => void;
+  /** a GPU descartou o contexto WebGL (comum em celulares com pouca memória) */
+  onContextLost?: () => void;
 }
 
-export default function CampusScene(props: Props) {
+export default function CampusScene({ onContextLost, ...props }: Props) {
   const { view, selected, route, dark, onBackground } = props;
   const t = dark ? THEME.dark : THEME.light;
+  // o R3F força a perda do contexto ao desmontar (troca de aba): isso não é falha
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
   return (
     <div className="absolute inset-0" style={{ background: t.bg }}>
       <Canvas
@@ -569,6 +579,12 @@ export default function CampusScene(props: Props) {
         dpr={[1, 1.75]}
         camera={{ fov: 38, near: 0.1, far: 140, position: [0, 30, 20] }}
         gl={{ antialias: true, powerPreference: "high-performance" }}
+        onCreated={({ gl }) => {
+          gl.domElement.addEventListener("webglcontextlost", (e) => {
+            e.preventDefault();
+            if (alive.current) onContextLost?.();
+          });
+        }}
         onPointerMissed={(e) => {
           // cliques nos pinos (HTML por cima do canvas) não contam como "clicar no vazio"
           if ((e.target as HTMLElement | null)?.closest?.("[data-pin]")) return;

@@ -322,3 +322,12 @@ html.totem {
 
 .no-scrollbar::-webkit-scrollbar { display: none; }
 .no-scrollbar { scrollbar-width: none; }
+
+/* O WebGL muda a cada frame durante gestos. Blur só em ponteiros precisos,
+   evitando superfícies de composição extras nos navegadores móveis. */
+@media (pointer: fine) and (min-width: 769px) {
+  .map-glass {
+    -webkit-backdrop-filter: blur(16px);
+    backdrop-filter: blur(16px);
+  }
+}

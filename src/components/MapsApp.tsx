@@ -29,20 +29,10 @@ import { stopIndexOf } from "@/lib/streetview";
 import { useLayout, useNow, useReservations, useSettings, type Settings } from "@/lib/store";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
-import CampusMap, { type BuildingStats } from "./CampusMap";
-import DetailPanel, { type PanelTarget } from "./DetailPanel";
-import RoomList from "./RoomList";
-import Reservations from "./Reservations";
-import ARView from "./ARView";
-import StreetView from "./StreetView";
-import SettingsPanel from "./SettingsPanel";
-import IdleScreen from "./IdleScreen";
-import { SceneBoundary, SceneFallback, hasWebGL } from "./SceneBoundary";
+import type { BuildingStats } from "./CampusMap";
+import type { PanelTarget } from "./DetailPanel";
 
 gsap.registerPlugin(useGSAP);
-
-let webglCache: boolean | undefined;
-const hasWebGLCached = () => (webglCache ??= hasWebGL());
 
 const CampusScene = dynamic(() => import("./CampusScene"), {
   ssr: false,
@@ -116,14 +106,6 @@ export default function MapsApp({ variant }: { variant: "mobile" | "totem" }) {
   const [idle, setIdle] = useState(totem);
   const [focusSearch, setFocusSearch] = useState(false);
   const [tourStart, setTourStart] = useState(0);
-  // sem WebGL (ou GPU perdida) o mapa 3D não roda: mostra aviso em vez de derrubar o app
-  const webgl = useSyncExternalStore(
-    () => () => {},
-    hasWebGLCached,
-    () => true,
-  );
-  const [contextLost, setContextLost] = useState(false);
-  const sceneFailed = !webgl || contextLost;
   const view = settings.view;
   const root = useRef<HTMLDivElement>(null);
 
@@ -279,23 +261,18 @@ export default function MapsApp({ variant }: { variant: "mobile" | "totem" }) {
                     setTab("passeio");
                   }}
                 />
-              ) : sceneFailed ? (
-                <SceneFallback onBuildings={() => setSettings({ view: "predios" })} />
               ) : (
-                <SceneBoundary fallback={(reason) => <SceneFallback reason={reason} onBuildings={() => setSettings({ view: "predios" })} />}>
-                  <CampusScene
-                    view={view}
-                    layout={layout}
-                    selected={selectedBuilding}
-                    route={route}
-                    stats={stats}
-                    hereLabel={hereLabel}
-                    dark={dark}
-                    onSelect={openBuilding}
-                    onBackground={() => panel?.kind === "building" && setPanel(null)}
-                    onContextLost={() => setContextLost(true)}
-                  />
-                </SceneBoundary>
+                <CampusScene
+                  view={view}
+                  layout={layout}
+                  selected={selectedBuilding}
+                  route={route}
+                  stats={stats}
+                  hereLabel={hereLabel}
+                  dark={dark}
+                  onSelect={openBuilding}
+                  onBackground={() => panel?.kind === "building" && setPanel(null)}
+                />
               )}
             </>
           )}

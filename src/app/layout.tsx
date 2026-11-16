@@ -2,6 +2,8 @@ import type { Metadata, Viewport } from "next";
 import { Montserrat, Roboto } from "next/font/google";
 import "./globals.css";
 import { cn } from "@/lib/utils";
+import { LoadGuardScript } from "@/components/LoadGuardScript";
+import { LoadGuardReady } from "@/components/LoadGuard";
 
 const montserrat = Montserrat({ variable: "--font-montserrat", subsets: ["latin"] });
 const roboto = Roboto({ variable: "--font-roboto", subsets: ["latin"], weight: ["400", "500", "700"] });
@@ -21,7 +23,13 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
     <html lang="pt-BR" className={cn("h-full", "antialiased", montserrat.variable, roboto.variable)} suppressHydrationWarning>
-      <body className="min-h-full font-sans">{children}</body>
+      <head>
+        <LoadGuardScript />
+      </head>
+      <body className="min-h-full font-sans">
+        {children}
+        <LoadGuardReady />
+      </body>
     </html>
   );
 }

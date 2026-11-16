@@ -268,7 +268,7 @@ export default function MapsApp({ variant }: { variant: "mobile" | "totem" }) {
               ) : sceneFailed ? (
                 <SceneFallback onBuildings={() => setSettings({ view: "predios" })} />
               ) : (
-                <SceneBoundary fallback={<SceneFallback onBuildings={() => setSettings({ view: "predios" })} />}>
+                <SceneBoundary fallback={(reason) => <SceneFallback reason={reason} onBuildings={() => setSettings({ view: "predios" })} />}>
                   <CampusScene
                     view={view}
                     layout={layout}

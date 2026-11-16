@@ -10,7 +10,7 @@
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { Html, Line, OrbitControls, useTexture } from "@react-three/drei";
 import { Bloom, EffectComposer, Vignette } from "@react-three/postprocessing";
-import { Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Suspense, createContext, useContext, useEffect, useMemo, useRef, useState, type ComponentProps, type RefObject } from "react";
 import gsap from "gsap";
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
@@ -23,6 +23,19 @@ export type SceneView = "satelite" | "mapa" | "3d";
 export interface SceneStats {
   free: number;
   total: number;
+}
+
+/*
+ * Rótulos HTML (<Html> do drei) vão para um elemento FIXO desde o 1º render.
+ * Sem isso o drei usa `events.connected || canvas.parentNode`, que muda logo
+ * após montar: o efeito roda de novo no mesmo <div>, o React 19 adia o unmount
+ * da raiz antiga e, ao desmontar a cena (troca de aba), lança
+ * "Failed to execute 'removeChild' on 'Node'".
+ */
+const LabelHost = createContext<RefObject<HTMLElement> | undefined>(undefined);
+function Label(props: ComponentProps<typeof Html>) {
+  const portal = useContext(LabelHost);
+  return <Html portal={portal} {...props} />;
 }
 
 const X = (x: number) => (x - MAP.width / 2) / 100;
@@ -204,9 +217,9 @@ function Areas({ dark }: { dark: boolean }) {
                 <meshBasicMaterial color="#ff9a1f" transparent opacity={dark ? 0.22 : 0.28} depthWrite={false} toneMapped={false} />
               </mesh>
               <Line points={outline} color="#ff9a1f" lineWidth={2} dashed dashSize={0.1} gapSize={0.07} />
-              <Html position={[X(cx), 0.05, Z(cy)]} center zIndexRange={[15, 0]} style={{ pointerEvents: "none" }}>
+              <Label position={[X(cx), 0.05, Z(cy)]} center zIndexRange={[15, 0]} style={{ pointerEvents: "none" }}>
                 <span className="rounded-full bg-[#ff9a1f] px-2 py-0.5 font-display text-[10px] font-bold whitespace-nowrap text-[#1b0d17] shadow">{a.name}</span>
-              </Html>
+              </Label>
             </group>
           );
         }
@@ -219,11 +232,11 @@ function Areas({ dark }: { dark: boolean }) {
             </mesh>
             <Line points={outline} color={dark ? "#a08d98" : "#8a7a84"} lineWidth={1.2} dashed dashSize={0.08} gapSize={0.08} transparent opacity={0.8} />
             {firstOfName && (
-              <Html position={[X(cx), 3 * FLOOR_H + 0.15, Z(cy)]} center zIndexRange={[15, 0]} style={{ pointerEvents: "none" }}>
+              <Label position={[X(cx), 3 * FLOOR_H + 0.15, Z(cy)]} center zIndexRange={[15, 0]} style={{ pointerEvents: "none" }}>
                 <span className="rounded-full bg-black/55 px-2 py-0.5 text-[10px] font-medium whitespace-nowrap text-white/80 ring-1 ring-white/15 backdrop-blur">
                   Colégio Dom Bosco · fora do mapa
                 </span>
-              </Html>
+              </Label>
             )}
           </group>
         );
@@ -356,7 +369,7 @@ function Building({ b, selected, dimmed, dark, stats, index, facade, roofSat, ha
       </group>
 
       {/* pino */}
-      <Html position={[X(cx), h + 0.3, Z(cy)]} center zIndexRange={[20, 0]}>
+      <Label position={[X(cx), h + 0.3, Z(cy)]} center zIndexRange={[20, 0]}>
         <button
           data-pin
           onClick={() => onSelect(b.id)}
@@ -376,7 +389,7 @@ function Building({ b, selected, dimmed, dark, stats, index, facade, roofSat, ha
             </span>
           )}
         </button>
-      </Html>
+      </Label>
     </group>
   );
 }
@@ -398,9 +411,9 @@ function Here({ x, y, label }: { x: number; y: number; label: string }) {
         <ringGeometry args={[0.085, 0.105, 40]} />
         <meshBasicMaterial color="#1b0d17" toneMapped={false} />
       </mesh>
-      <Html position={[0, 0.05, 0]} center zIndexRange={[19, 0]} style={{ pointerEvents: "none" }}>
+      <Label position={[0, 0.05, 0]} center zIndexRange={[19, 0]} style={{ pointerEvents: "none" }}>
         <div className="-translate-y-6 rounded-full bg-[#ffba00] px-2.5 py-1 font-display text-[11px] font-extrabold whitespace-nowrap text-[#1b0d17] shadow-lg">{label}</div>
-      </Html>
+      </Label>
     </group>
   );
 }
@@ -655,23 +668,40 @@ interface Props {
   dark: boolean;
   onSelect: (id: BuildingId) => void;
   onBackground?: () => void;
+  /** a GPU descartou o contexto WebGL (comum em celulares com pouca memória) */
+  onContextLost?: () => void;
 }
 
-export default function CampusScene(props: Props) {
+export default function CampusScene({ onContextLost, ...props }: Props) {
   const { view, selected, route, dark, onBackground } = props;
   const t = dark ? THEME.dark : THEME.light;
-  const [quality] = useState(detectSceneQuality);
-  const [contextLost, setContextLost] = useState(false);
-  const [rendererKey, setRendererKey] = useState(0);
+  // o R3F força a perda do contexto ao desmontar (troca de aba): isso não é falha
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+  // a cena só monta depois que o host dos rótulos existe (alvo estável para o <Html>)
+  const [host, setHost] = useState<HTMLDivElement | null>(null);
+  const labelHost = useMemo(() => (host ? { current: host } : undefined), [host]);
   return (
-    <div className="absolute inset-0" data-webgl-quality={quality.name} style={{ background: t.bg }}>
+    <div ref={setHost} className="absolute inset-0" style={{ background: t.bg }}>
+      {labelHost && (
       <Canvas
         key={rendererKey}
         frameloop="demand"
         shadows={quality.shadows}
         dpr={quality.dpr}
         camera={{ fov: 38, near: 0.1, far: 140, position: [0, 30, 20] }}
-        gl={{ antialias: quality.antialias, powerPreference: "high-performance" }}
+        gl={{ antialias: true, powerPreference: "high-performance" }}
+        onCreated={({ gl }) => {
+          gl.domElement.addEventListener("webglcontextlost", (e) => {
+            e.preventDefault();
+            if (alive.current) onContextLost?.();
+          });
+        }}
         onPointerMissed={(e) => {
           // cliques nos pinos (HTML por cima do canvas) não contam como "clicar no vazio"
           if ((e.target as HTMLElement | null)?.closest?.("[data-pin]")) return;

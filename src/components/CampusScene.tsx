@@ -14,35 +14,19 @@
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { Html, Line, OrbitControls, useGLTF, useTexture } from "@react-three/drei";
 import { Bloom, EffectComposer, Vignette } from "@react-three/postprocessing";
-import { Component, Suspense, createContext, useContext, useEffect, useMemo, useRef, useState, type ComponentProps, type ReactNode, type RefObject } from "react";
+import { Component, Suspense, useLayoutEffect, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import gsap from "gsap";
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 import { AREAS, BUILDINGS, MAP, bbox, centroid, type Building as BuildingData, type BuildingId, type Layout, type Pt } from "@/lib/campus";
 import type { RoutePlan } from "@/lib/route";
+import { sceneQualityFor, type SceneQuality } from "@/lib/webgl-quality";
 
 export type SceneView = "satelite" | "mapa" | "3d";
-
-// Em máquinas fracas (ou com quadros atrasados), o GSAP por padrão "estica" as
-// animações. Aqui preferimos que a câmera chegue no tempo certo, mesmo pulando quadros.
-gsap.ticker.lagSmoothing(0);
 
 export interface SceneStats {
   free: number;
   total: number;
-}
-
-/*
- * Rótulos HTML (<Html> do drei) vão para um elemento FIXO desde o 1º render.
- * Sem isso o drei usa `events.connected || canvas.parentNode`, que muda logo
- * após montar: o efeito roda de novo no mesmo <div>, o React 19 adia o unmount
- * da raiz antiga e, ao desmontar a cena (troca de aba), lança
- * "Failed to execute 'removeChild' on 'Node'".
- */
-const LabelHost = createContext<RefObject<HTMLElement> | undefined>(undefined);
-function Label(props: ComponentProps<typeof Html>) {
-  const portal = useContext(LabelHost);
-  return <Html portal={portal} {...props} />;
 }
 
 const X = (x: number) => (x - MAP.width / 2) / 100;
@@ -128,22 +112,24 @@ const THEME = {
   light: { bg: "#fbf6f2", ground: "#ffffff", wall: "#f7efe9", wallLine: "#e3d3c8", street: "#e6dad2", window: "#9fb3c4", lit: "#fff1cf", ghost: "#8a7a84" },
 };
 
-/* ------------------------------------------------------------------ texturas */
-
-function seeded(seed: number) {
-  return () => {
-    seed = (seed * 16807) % 2147483647;
-    return seed / 2147483647;
-  };
+function detectSceneQuality() {
+  const nav = navigator as Navigator & { deviceMemory?: number };
+  return sceneQualityFor({
+    width: window.innerWidth,
+    coarsePointer: window.matchMedia("(pointer: coarse)").matches,
+    reducedMotion: window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+    memoryGb: nav.deviceMemory,
+    cores: nav.hardwareConcurrency,
+  });
 }
 
-/** Fachada procedural: faixas de laje + janelas em trios, algumas acesas. */
-function facade(lenUnits: number, floors: number, dark: boolean, seed: number) {
+/* ------------------------------------------------------------------ texturas */
+
+/** Uma fachada repetível compartilhada por todas as paredes. */
+function facadeAtlas(dark: boolean) {
   const t = dark ? THEME.dark : THEME.light;
-  const ppu = 300;
-  const w = Math.max(64, Math.round(lenUnits * ppu));
-  const fh = 96;
-  const h = fh * floors;
+  const w = 256;
+  const h = 96;
   const base = document.createElement("canvas");
   base.width = w;
   base.height = h;
@@ -156,33 +142,31 @@ function facade(lenUnits: number, floors: number, dark: boolean, seed: number) {
   g.fillRect(0, 0, w, h);
   b.fillStyle = t.wall;
   b.fillRect(0, 0, w, h);
-  const rnd = seeded(seed);
-  for (let f = 0; f < floors; f++) {
-    const y0 = f * fh;
-    b.fillStyle = t.wallLine;
-    b.fillRect(0, y0, w, 6);
-    const winW = 14;
-    const gap = 5;
-    const bay = 3 * (winW + gap) + 14;
-    for (let x = 10; x + bay < w; x += bay) {
-      const lit = rnd() < (dark ? 0.38 : 0.1);
-      const warm = rnd() < 0.5 ? t.lit : dark ? "#ffe2b8" : t.lit;
-      for (let k = 0; k < 3; k++) {
-        const wx = x + k * (winW + gap);
-        b.fillStyle = lit ? warm : t.window;
-        b.fillRect(wx, y0 + 30, winW, 38);
-        if (lit) {
-          g.fillStyle = warm;
-          g.fillRect(wx, y0 + 30, winW, 38);
-        }
+  b.fillStyle = t.wallLine;
+  b.fillRect(0, 0, w, 6);
+  const winW = 14;
+  const gap = 5;
+  const bay = 3 * (winW + gap) + 14;
+  for (let x = 10, bayIndex = 0; x + bay < w; x += bay, bayIndex++) {
+    const lit = dark ? bayIndex % 3 !== 1 : bayIndex === 2;
+    const warm = bayIndex % 2 ? "#ffe2b8" : t.lit;
+    for (let k = 0; k < 3; k++) {
+      const wx = x + k * (winW + gap);
+      b.fillStyle = lit ? warm : t.window;
+      b.fillRect(wx, 30, winW, 38);
+      if (lit) {
+        g.fillStyle = warm;
+        g.fillRect(wx, 30, winW, 38);
       }
     }
   }
   const map = new THREE.CanvasTexture(base);
   map.colorSpace = THREE.SRGBColorSpace;
-  map.anisotropy = 4;
+  map.wrapS = map.wrapT = THREE.RepeatWrapping;
+  map.anisotropy = 2;
   const emissive = new THREE.CanvasTexture(glow);
   emissive.colorSpace = THREE.SRGBColorSpace;
+  emissive.wrapS = emissive.wrapT = THREE.RepeatWrapping;
   return { map, emissive };
 }
 
@@ -216,17 +200,35 @@ function worldSat(tex: THREE.Texture) {
   return t;
 }
 
+function FacadeGeometry({ len, height, floors }: { len: number; height: number; floors: number }) {
+  const geometry = useRef<THREE.PlaneGeometry>(null);
+  useLayoutEffect(() => {
+    const uv = geometry.current?.attributes.uv;
+    if (!uv) return;
+    const repeatX = Math.max(1, len / 0.85);
+    for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) * repeatX, uv.getY(i) * floors);
+    uv.needsUpdate = true;
+  }, [floors, len]);
+  return <planeGeometry ref={geometry} args={[len, height]} />;
+}
+
 /* -------------------------------------------------------------------- chão */
 
-function Ground({ view, dark, sat }: { view: SceneView; dark: boolean; sat: THREE.Texture }) {
+function Ground({ view, dark, sat, shadows }: { view: SceneView; dark: boolean; sat: THREE.Texture; shadows: boolean }) {
   const fade = useMemo(() => radialTexture(0.7), []);
   const mat = useRef<THREE.MeshBasicMaterial>(null);
+  const invalidate = useThree((state) => state.invalidate);
   const t = dark ? THEME.dark : THEME.light;
+
+  useEffect(() => () => fade.dispose(), [fade]);
 
   useEffect(() => {
     if (!mat.current) return;
-    gsap.to(mat.current, { opacity: view === "mapa" ? 0 : 1, duration: 0.8, ease: "power2.out" });
-  }, [view]);
+    const tween = gsap.to(mat.current, { opacity: view === "mapa" ? 0 : 1, duration: 0.8, ease: "power2.out", onUpdate: invalidate });
+    return () => {
+      tween.kill();
+    };
+  }, [invalidate, view]);
 
   const avenue = useMemo(() => {
     const { origin: o, dir: d, normal: n } = MAP.avenue;
@@ -247,10 +249,12 @@ function Ground({ view, dark, sat }: { view: SceneView; dark: boolean; sat: THRE
         <planeGeometry args={[MAP.width / 100, MAP.height / 100]} />
         <meshBasicMaterial ref={mat} map={sat} alphaMap={fade} color={t.ground} transparent toneMapped={false} />
       </mesh>
-      <mesh rotation-x={-Math.PI / 2} position-y={0.006} receiveShadow>
-        <planeGeometry args={[MAP.width / 100, MAP.height / 100]} />
-        <shadowMaterial opacity={dark ? 0.55 : 0.22} />
-      </mesh>
+      {shadows && (
+        <mesh rotation-x={-Math.PI / 2} position-y={0.006} receiveShadow>
+          <planeGeometry args={[MAP.width / 100, MAP.height / 100]} />
+          <shadowMaterial opacity={dark ? 0.55 : 0.22} />
+        </mesh>
+      )}
     </group>
   );
 }
@@ -282,9 +286,9 @@ function Areas({ dark, garage }: { dark: boolean; garage?: THREE.Object3D }) {
               </mesh>
               <Line points={outline} color="#ff9a1f" lineWidth={2} dashed dashSize={0.1} gapSize={0.07} />
               {garage && a.id === "garagem" && <ModelPiece src={garage} dark={dark} />}
-              <Label position={[X(cx), garage && a.id === "garagem" ? GARAGE_H + 0.12 : 0.05, Z(cy)]} center zIndexRange={[15, 0]} style={{ pointerEvents: "none" }}>
+              <Html position={[X(cx), garage && a.id === "garagem" ? GARAGE_H + 0.12 : 0.05, Z(cy)]} center zIndexRange={[15, 0]} style={{ pointerEvents: "none" }}>
                 <span className="rounded-full bg-[#ff9a1f] px-2 py-0.5 font-display text-[10px] font-bold whitespace-nowrap text-[#1b0d17] shadow">{a.name}</span>
-              </Label>
+              </Html>
             </group>
           );
         }
@@ -297,11 +301,11 @@ function Areas({ dark, garage }: { dark: boolean; garage?: THREE.Object3D }) {
             </mesh>
             <Line points={outline} color={dark ? "#a08d98" : "#8a7a84"} lineWidth={1.2} dashed dashSize={0.08} gapSize={0.08} transparent opacity={0.8} />
             {firstOfName && (
-              <Label position={[X(cx), 3 * FLOOR_H + 0.15, Z(cy)]} center zIndexRange={[15, 0]} style={{ pointerEvents: "none" }}>
+              <Html position={[X(cx), 3 * FLOOR_H + 0.15, Z(cy)]} center zIndexRange={[15, 0]} style={{ pointerEvents: "none" }}>
                 <span className="rounded-full bg-black/55 px-2 py-0.5 text-[10px] font-medium whitespace-nowrap text-white/80 ring-1 ring-white/15 backdrop-blur">
                   Colégio Dom Bosco · fora do mapa
                 </span>
-              </Label>
+              </Html>
             )}
           </group>
         );
@@ -319,80 +323,100 @@ interface BuildingProps {
   dark: boolean;
   stats?: SceneStats;
   index: number;
-  sat: THREE.Texture;
+  facade: ReturnType<typeof facadeAtlas>;
+  roofSat: THREE.Texture;
+  haloTex: THREE.Texture;
+  shadows: boolean;
   model?: THREE.Object3D;
   onSelect: (id: BuildingId) => void;
 }
 
-function Building({ b, selected, dimmed, dark, stats, index, sat, model, onSelect }: BuildingProps) {
+function Building({ b, selected, dimmed, dark, stats, index, facade, roofSat, haloTex, shadows, model, onSelect }: BuildingProps) {
   const h = b.floors * FLOOR_H;
   const top = h + (model ? PARAPET_H : 0);
   const group = useRef<THREE.Group>(null);
   const halo = useRef<THREE.MeshBasicMaterial>(null);
   const [hover, setHover] = useState(false);
+  const invalidate = useThree((state) => state.invalidate);
   const box = bbox(b.poly);
   const [cx, cy] = centroid(b.poly);
 
   const modelClone = useMemo(() => (model ? cloneModel(model, dark) : null), [model, dark]);
 
-  const { walls, roofMat, roofShape, mats } = useMemo(() => {
-    const mats: THREE.Material[] = [];
-    if (modelClone) return { walls: [], roofMat: null, roofShape: null, mats: modelClone.mats as THREE.Material[] };
+  const { walls, wallMat, roofMat, roofShape } = useMemo(() => {
+    if (modelClone) return { walls: [], wallMat: undefined, roofMat: undefined, roofShape: undefined };
     const walls = b.poly.map(([ax, ay], i) => {
       const [bx, by] = b.poly[(i + 1) % b.poly.length];
       const A = new THREE.Vector2(X(ax), Z(ay));
       const B = new THREE.Vector2(X(bx), Z(by));
       const len = A.distanceTo(B);
-      const f = facade(len, b.floors, dark, 7 + index * 31 + i * 13);
-      const m = new THREE.MeshStandardMaterial({
-        map: f.map,
-        emissiveMap: f.emissive,
-        emissive: new THREE.Color("#ffffff"),
-        emissiveIntensity: dark ? 1.25 : 0.15,
-        roughness: 0.85,
-        side: THREE.DoubleSide,
-      });
-      mats.push(m);
       return {
         len,
         mid: [(A.x + B.x) / 2, h / 2, (A.y + B.y) / 2] as [number, number, number],
         rotY: Math.atan2(-(B.y - A.y), B.x - A.x),
-        mat: m,
       };
     });
-    // telhado = recorte REAL da imagem de satélite
-    const roofMat = new THREE.MeshBasicMaterial({ map: worldSat(sat), color: dark ? "#c2b0ba" : "#ffffff", toneMapped: false });
-    mats.push(roofMat);
-    for (const m of mats) m.userData.base = (m as THREE.MeshBasicMaterial).color.clone();
-    return { walls, roofMat, roofShape: shapeOf(b.poly), mats };
-  }, [b, dark, index, sat, h, modelClone]);
+    const wallMat = new THREE.MeshStandardMaterial({
+      map: facade.map,
+      emissiveMap: facade.emissive,
+      emissive: new THREE.Color("#ffffff"),
+      emissiveIntensity: dark ? 1.25 : 0.15,
+      roughness: 0.85,
+      side: THREE.DoubleSide,
+    });
+    const roofMat = new THREE.MeshBasicMaterial({ map: roofSat, color: dark ? "#c2b0ba" : "#ffffff", toneMapped: false });
+    return { walls, wallMat, roofMat, roofShape: shapeOf(b.poly) };
+  }, [b, dark, facade, h, roofSat, modelClone]);
 
-  useEffect(() => () => mats.forEach((m) => m.dispose()), [mats]);
+  useEffect(
+    () => () => {
+      wallMat?.dispose();
+      roofMat?.dispose();
+    },
+    [roofMat, wallMat],
+  );
+
+  useEffect(() => () => modelClone?.mats.forEach((m) => m.dispose()), [modelClone]);
 
   // entrada: os prédios "crescem" do chão
   useEffect(() => {
     if (!group.current) return;
-    gsap.fromTo(group.current.scale, { y: 0.001 }, { y: 1, duration: 1.1, delay: 0.35 + index * 0.1, ease: "expo.out" });
-  }, [index]);
+    const tween = gsap.fromTo(group.current.scale, { y: 0.001 }, { y: 1, duration: 1.1, delay: 0.35 + index * 0.1, ease: "expo.out", onUpdate: invalidate });
+    return () => {
+      tween.kill();
+    };
+  }, [index, invalidate]);
 
   useEffect(() => {
     if (!halo.current) return;
-    gsap.to(halo.current, { opacity: selected ? 0.85 : hover ? 0.4 : 0, duration: 0.35 });
-  }, [selected, hover]);
+    const tween = gsap.to(halo.current, { opacity: selected ? 0.85 : hover ? 0.4 : 0, duration: 0.35, onUpdate: invalidate });
+    return () => {
+      tween.kill();
+    };
+  }, [selected, hover, invalidate]);
 
   // não selecionados escurecem (sem transparência, para não "vazar" o halo)
   useEffect(() => {
     const k = dimmed ? 0.45 : 1;
-    mats.forEach((m) => {
-      const base = m.userData.base as THREE.Color;
-      gsap.to((m as THREE.MeshStandardMaterial).color, { r: base.r * k, g: base.g * k, b: base.b * k, duration: 0.45 });
-      // janelas acesas do modelo também apagam
-      const ei = m.userData.baseEmissive as number | undefined;
-      if (ei) gsap.to(m, { emissiveIntensity: ei * (dimmed ? 0.3 : 1), duration: 0.45 });
-    });
-  }, [dimmed, mats]);
+    const tweens: gsap.core.Tween[] = [];
+    if (modelClone) {
+      for (const m of modelClone.mats) {
+        const base = m.userData.base as THREE.Color;
+        tweens.push(gsap.to(m.color, { r: base.r * k, g: base.g * k, b: base.b * k, duration: 0.45, onUpdate: invalidate }));
+        // janelas acesas do modelo também apagam
+        const ei = m.userData.baseEmissive as number | undefined;
+        if (ei) tweens.push(gsap.to(m, { emissiveIntensity: ei * (dimmed ? 0.3 : 1), duration: 0.45, onUpdate: invalidate }));
+      }
+    } else if (wallMat && roofMat) {
+      const roofBase = new THREE.Color(dark ? "#c2b0ba" : "#ffffff");
+      tweens.push(
+        gsap.to(wallMat.color, { r: k, g: k, b: k, duration: 0.45, onUpdate: invalidate }),
+        gsap.to(roofMat.color, { r: roofBase.r * k, g: roofBase.g * k, b: roofBase.b * k, duration: 0.45, onUpdate: invalidate }),
+      );
+    }
+    return () => tweens.forEach((tween) => tween.kill());
+  }, [dark, dimmed, invalidate, modelClone, roofMat, wallMat]);
 
-  const haloTex = useMemo(() => radialTexture(0), []);
   const edge = [...b.poly, b.poly[0]].map(([x, y]) => [X(x), top + 0.025, Z(y)] as [number, number, number]);
   const pointer = {
     onClick: (e: { stopPropagation: () => void }) => {
@@ -426,12 +450,12 @@ function Building({ b, selected, dimmed, dark, stats, index, sat, model, onSelec
           </group>
         )}
         {walls.map((w, i) => (
-          <mesh key={i} position={w.mid} rotation-y={w.rotY} material={w.mat} castShadow {...pointer}>
-            <planeGeometry args={[w.len, h]} />
+          <mesh key={i} position={w.mid} rotation-y={w.rotY} material={wallMat} castShadow={shadows} {...pointer}>
+            <FacadeGeometry len={w.len} height={h} floors={b.floors} />
           </mesh>
         ))}
         {roofMat && roofShape && (
-          <mesh rotation-x={-Math.PI / 2} position-y={h} material={roofMat} castShadow {...pointer}>
+          <mesh rotation-x={-Math.PI / 2} position-y={h} material={roofMat} castShadow={shadows} {...pointer}>
             <shapeGeometry args={[roofShape]} />
           </mesh>
         )}
@@ -440,7 +464,7 @@ function Building({ b, selected, dimmed, dark, stats, index, sat, model, onSelec
       </group>
 
       {/* pino */}
-      <Label position={[X(cx), top + (model ? 0.4 : 0.3), Z(cy)]} center zIndexRange={[20, 0]}>
+      <Html position={[X(cx), top + (model ? 0.4 : 0.3), Z(cy)]} center zIndexRange={[20, 0]}>
         <button
           data-pin
           onClick={() => onSelect(b.id)}
@@ -460,7 +484,7 @@ function Building({ b, selected, dimmed, dark, stats, index, sat, model, onSelec
             </span>
           )}
         </button>
-      </Label>
+      </Html>
     </group>
   );
 }
@@ -468,18 +492,11 @@ function Building({ b, selected, dimmed, dark, stats, index, sat, model, onSelec
 /* ---------------------------------------------------- "você está aqui" e rota */
 
 function Here({ x, y, label }: { x: number; y: number; label: string }) {
-  const ring = useRef<THREE.Mesh>(null);
-  useFrame(({ clock }) => {
-    if (!ring.current) return;
-    const k = (clock.elapsedTime % 1.8) / 1.8;
-    ring.current.scale.setScalar(0.6 + k * 1.8);
-    (ring.current.material as THREE.MeshBasicMaterial).opacity = 0.7 * (1 - k);
-  });
   return (
     <group position={[X(x), 0.02, Z(y)]}>
-      <mesh ref={ring} rotation-x={-Math.PI / 2}>
-        <ringGeometry args={[0.1, 0.14, 48]} />
-        <meshBasicMaterial color="#ffba00" transparent toneMapped={false} />
+      <mesh rotation-x={-Math.PI / 2}>
+        <ringGeometry args={[0.12, 0.2, 40]} />
+        <meshBasicMaterial color="#ffba00" transparent opacity={0.42} toneMapped={false} />
       </mesh>
       <mesh rotation-x={-Math.PI / 2}>
         <circleGeometry args={[0.085, 40]} />
@@ -489,9 +506,9 @@ function Here({ x, y, label }: { x: number; y: number; label: string }) {
         <ringGeometry args={[0.085, 0.105, 40]} />
         <meshBasicMaterial color="#1b0d17" toneMapped={false} />
       </mesh>
-      <Label position={[0, 0.05, 0]} center zIndexRange={[19, 0]} style={{ pointerEvents: "none" }}>
+      <Html position={[0, 0.05, 0]} center zIndexRange={[19, 0]} style={{ pointerEvents: "none" }}>
         <div className="-translate-y-6 rounded-full bg-[#ffba00] px-2.5 py-1 font-display text-[11px] font-extrabold whitespace-nowrap text-[#1b0d17] shadow-lg">{label}</div>
-      </Label>
+      </Html>
     </group>
   );
 }
@@ -509,23 +526,36 @@ function Route({ route }: { route: RoutePlan }) {
   const [count, setCount] = useState(2);
   const progress = useRef({ v: 0 });
   const dot = useRef<THREE.Mesh>(null);
+  const motionStart = useRef<number | null>(null);
+  const invalidate = useThree((state) => state.invalidate);
 
   useEffect(() => {
     progress.current.v = 0;
+    motionStart.current = null;
     const tw = gsap.to(progress.current, {
       v: 1,
       duration: 1.2,
       ease: "power2.inOut",
-      onUpdate: () => setCount(Math.max(2, Math.round(progress.current.v * all.length))),
+      onUpdate: () => {
+        setCount(Math.max(2, Math.round(progress.current.v * all.length)));
+        invalidate();
+      },
     });
     return () => {
       tw.kill();
     };
-  }, [all]);
+  }, [all, invalidate]);
 
   useFrame(({ clock }) => {
     if (!dot.current || progress.current.v < 1) return;
-    dot.current.position.copy(curve.getPoint((clock.elapsedTime * 0.4) % 1));
+    motionStart.current ??= clock.elapsedTime;
+    const elapsed = clock.elapsedTime - motionStart.current;
+    if (elapsed < 6) {
+      dot.current.position.copy(curve.getPoint((elapsed * 0.4) % 1));
+      invalidate();
+    } else {
+      dot.current.position.copy(curve.getPoint(1));
+    }
   });
 
   const pts = all.slice(0, count);
@@ -555,6 +585,7 @@ const tilt0 = (v: SceneView) => v === "3d";
 function Rig({ view, focus, route, intro }: { view: SceneView; focus: BuildingId | null; route: RoutePlan | null; intro: boolean }) {
   const { camera, size } = useThree();
   const controls = useThree((s) => s.controls) as unknown as OrbitControlsImpl | null;
+  const invalidate = useThree((s) => s.invalidate);
   const first = useRef(true);
 
   useEffect(() => {
@@ -598,7 +629,13 @@ function Rig({ view, focus, route, intro }: { view: SceneView; focus: BuildingId
     if (first.current && intro) cam.position.set(dest.x + 4, dest.y + 14, dest.z + 10);
     const dur = first.current ? 2.2 : 1.1;
     first.current = false;
-    const tl = gsap.timeline({ defaults: { duration: dur, ease: "expo.inOut" }, onUpdate: () => controls.update() });
+    const tl = gsap.timeline({
+      defaults: { duration: dur, ease: "expo.inOut" },
+      onUpdate: () => {
+        controls.update();
+        invalidate();
+      },
+    });
     tl.to(cam.position, { x: dest.x, y: dest.y, z: dest.z }, 0).to(controls.target, { x: target.x, y: target.y, z: target.z }, 0);
     tl.eventCallback("onComplete", () => {
       cam.position.copy(dest);
@@ -614,7 +651,7 @@ function Rig({ view, focus, route, intro }: { view: SceneView; focus: BuildingId
     return () => {
       tl.kill();
     };
-  }, [view, focus, route, size.width, size.height, camera, controls, intro]);
+  }, [view, focus, route, size.width, size.height, camera, controls, intro, invalidate]);
 
   return null;
 }
@@ -631,18 +668,30 @@ function World({
   hereLabel,
   dark,
   onSelect,
+  quality,
   model,
-}: Omit<Props, "onBackground"> & { model?: CampusModel }) {
-  const [night, day] = useTexture(["/campus/satelite-noite.jpg", "/campus/satelite-dia.jpg"], (texs) => {
-    for (const tx of texs) {
-      tx.colorSpace = THREE.SRGBColorSpace;
-      tx.anisotropy = 8;
-    }
+}: Omit<Props, "onBackground"> & { quality: SceneQuality; model?: CampusModel }) {
+  const sat = useTexture(dark ? "/campus/satelite-noite.jpg" : "/campus/satelite-dia.jpg", (texture) => {
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.anisotropy = quality.name === "economy" ? 2 : 4;
   });
-  const sat = dark ? night : day;
+  const facade = useMemo(() => facadeAtlas(dark), [dark]);
+  const roofSat = useMemo(() => worldSat(sat), [sat]);
+  const haloTex = useMemo(() => radialTexture(0), []);
+
+  useEffect(
+    () => () => {
+      facade.map.dispose();
+      facade.emissive.dispose();
+      roofSat.dispose();
+      haloTex.dispose();
+    },
+    [facade, haloTex, roofSat],
+  );
+
   return (
     <>
-      <Ground view={view} dark={dark} sat={sat} />
+      <Ground view={view} dark={dark} sat={sat} shadows={quality.shadows} />
       <Areas dark={dark} garage={model?.garage} />
       {model?.gate && <ModelPiece src={model.gate} dark={dark} />}
       {BUILDINGS.map((b, i) => (
@@ -654,7 +703,10 @@ function World({
           dimmed={!!selected && selected !== b.id}
           dark={dark}
           stats={stats[b.id]}
-          sat={sat}
+          facade={facade}
+          roofSat={roofSat}
+          haloTex={haloTex}
+          shadows={quality.shadows}
           model={model?.buildings[b.id]}
           onSelect={onSelect}
         />
@@ -666,7 +718,7 @@ function World({
 }
 
 /** Mundo com o modelo do Blender; os nós vêm pelo nome dado em gera_campus.py. */
-function ModelWorld(props: Omit<Props, "onBackground">) {
+function ModelWorld(props: Omit<Props, "onBackground"> & { quality: SceneQuality }) {
   const { nodes } = useGLTF(MODEL_URL);
   const model = useMemo<CampusModel>(() => {
     const buildings: CampusModel["buildings"] = {};
@@ -690,6 +742,45 @@ class ModelBoundary extends Component<{ fallback: ReactNode; children: ReactNode
   }
 }
 
+/* Objetos do renderer Three.js são externos ao React e configurados imperativamente. */
+/* eslint-disable react-hooks/immutability */
+function FreezeStaticShadows({ enabled }: { enabled: boolean }) {
+  const { gl, invalidate } = useThree();
+  useEffect(() => {
+    gl.shadowMap.autoUpdate = enabled;
+    if (!enabled) return;
+    const id = window.setTimeout(() => {
+      gl.shadowMap.autoUpdate = false;
+      gl.shadowMap.needsUpdate = true;
+      invalidate();
+    }, 2400);
+    return () => {
+      window.clearTimeout(id);
+      gl.shadowMap.autoUpdate = true;
+    };
+  }, [enabled, gl, invalidate]);
+  return null;
+}
+/* eslint-enable react-hooks/immutability */
+
+function WebGLContextEvents({ onLost, onRestored }: { onLost: () => void; onRestored: () => void }) {
+  const gl = useThree((state) => state.gl);
+  useEffect(() => {
+    const canvas = gl.domElement;
+    const lost = (event: Event) => {
+      event.preventDefault();
+      onLost();
+    };
+    canvas.addEventListener("webglcontextlost", lost);
+    canvas.addEventListener("webglcontextrestored", onRestored);
+    return () => {
+      canvas.removeEventListener("webglcontextlost", lost);
+      canvas.removeEventListener("webglcontextrestored", onRestored);
+    };
+  }, [gl, onLost, onRestored]);
+  return null;
+}
+
 interface Props {
   view: SceneView;
   layout: Layout;
@@ -700,38 +791,23 @@ interface Props {
   dark: boolean;
   onSelect: (id: BuildingId) => void;
   onBackground?: () => void;
-  /** a GPU descartou o contexto WebGL (comum em celulares com pouca memória) */
-  onContextLost?: () => void;
 }
 
-export default function CampusScene({ onContextLost, ...props }: Props) {
+export default function CampusScene(props: Props) {
   const { view, selected, route, dark, onBackground } = props;
   const t = dark ? THEME.dark : THEME.light;
-  // o R3F força a perda do contexto ao desmontar (troca de aba): isso não é falha
-  const alive = useRef(true);
-  useEffect(() => {
-    alive.current = true;
-    return () => {
-      alive.current = false;
-    };
-  }, []);
-  // a cena só monta depois que o host dos rótulos existe (alvo estável para o <Html>)
-  const [host, setHost] = useState<HTMLDivElement | null>(null);
-  const labelHost = useMemo(() => (host ? { current: host } : undefined), [host]);
+  const [quality] = useState(detectSceneQuality);
+  const [contextLost, setContextLost] = useState(false);
+  const [rendererKey, setRendererKey] = useState(0);
   return (
-    <div ref={setHost} className="absolute inset-0" style={{ background: t.bg }}>
-      {labelHost && (
+    <div className="absolute inset-0" data-webgl-quality={quality.name} style={{ background: t.bg }}>
       <Canvas
-        shadows
-        dpr={[1, 1.75]}
+        key={rendererKey}
+        frameloop="demand"
+        shadows={quality.shadows}
+        dpr={quality.dpr}
         camera={{ fov: 38, near: 0.1, far: 140, position: [0, 30, 20] }}
-        gl={{ antialias: true, powerPreference: "high-performance" }}
-        onCreated={({ gl }) => {
-          gl.domElement.addEventListener("webglcontextlost", (e) => {
-            e.preventDefault();
-            if (alive.current) onContextLost?.();
-          });
-        }}
+        gl={{ antialias: quality.antialias, powerPreference: "high-performance" }}
         onPointerMissed={(e) => {
           // cliques nos pinos (HTML por cima do canvas) não contam como "clicar no vazio"
           if ((e.target as HTMLElement | null)?.closest?.("[data-pin]")) return;
@@ -746,8 +822,8 @@ export default function CampusScene({ onContextLost, ...props }: Props) {
           position={[-7, 12, 6]}
           intensity={dark ? 0.9 : 2.2}
           color={dark ? "#b9a8ff" : "#fff3e2"}
-          castShadow
-          shadow-mapSize={[2048, 2048]}
+          castShadow={quality.shadows}
+          shadow-mapSize={[quality.shadowSize, quality.shadowSize]}
           shadow-camera-left={-10}
           shadow-camera-right={10}
           shadow-camera-top={9}
@@ -755,30 +831,46 @@ export default function CampusScene({ onContextLost, ...props }: Props) {
           shadow-bias={-0.0004}
         />
 
-        <LabelHost.Provider value={labelHost}>
-          <ModelBoundary
-            fallback={
-              <Suspense fallback={null}>
-                <World {...props} />
-              </Suspense>
-            }
-          >
+        <ModelBoundary
+          fallback={
             <Suspense fallback={null}>
-              <ModelWorld {...props} />
+              <World {...props} quality={quality} />
             </Suspense>
-          </ModelBoundary>
-        </LabelHost.Provider>
+          }
+        >
+          <Suspense fallback={null}>
+            <ModelWorld {...props} quality={quality} />
+          </Suspense>
+        </ModelBoundary>
 
         <OrbitControls makeDefault enableDamping dampingFactor={0.08} minDistance={2.5} maxDistance={32} screenSpacePanning />
-        <Rig view={view} focus={selected} route={route} intro />
+        <Rig view={view} focus={selected} route={route} intro={quality.animateIntro} />
+        <FreezeStaticShadows enabled={quality.shadows} />
+        <WebGLContextEvents onLost={() => setContextLost(true)} onRestored={() => setContextLost(false)} />
 
-        {dark && (
+        {dark && quality.postprocessing && (
           <EffectComposer multisampling={0}>
             <Bloom mipmapBlur intensity={0.7} luminanceThreshold={0.62} luminanceSmoothing={0.2} />
             <Vignette offset={0.25} darkness={0.55} />
           </EffectComposer>
         )}
       </Canvas>
+      {contextLost && (
+        <div className="absolute inset-0 z-30 grid place-items-center bg-background/95 p-6 text-center" role="alert">
+          <div className="max-w-sm rounded-3xl border border-border bg-card p-6 shadow-2xl">
+            <h2 className="font-display text-xl font-extrabold">O mapa 3D foi pausado</h2>
+            <p className="mt-2 text-sm text-muted-foreground">O navegador perdeu o contexto gráfico. Você pode reiniciar apenas o mapa sem recarregar a página.</p>
+            <button
+              className="mt-4 min-h-11 rounded-xl bg-primary px-4 font-semibold text-primary-foreground"
+              onClick={() => {
+                setContextLost(false);
+                setRendererKey((key) => key + 1);
+              }}
+            >
+              Reiniciar mapa 3D
+            </button>
+          </div>
+        </div>
       )}
     </div>
   );

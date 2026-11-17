@@ -2,7 +2,6 @@
 
 /* eslint-disable @next/next/no-img-element -- fotos do passeio em rotação, carregadas sob demanda */
 import { useEffect, useRef, useState } from "react";
-import dynamic from "next/dynamic";
 import gsap from "gsap";
 import { useGSAP } from "@gsap/react";
 import { Hand } from "lucide-react";
@@ -10,14 +9,6 @@ import { SEMESTER } from "@/lib/alocacao";
 import { STOPS } from "@/lib/streetview";
 
 gsap.registerPlugin(useGSAP);
-
-/**
- * Cena do Spline (opcional). Crie a cena no editor do Spline, publique e
- * coloque a URL em NEXT_PUBLIC_SPLINE_SCENE (.env.local). Sem a variável,
- * a tela usa as fotos reais do passeio ao fundo.
- */
-const SPLINE_SCENE = process.env.NEXT_PUBLIC_SPLINE_SCENE;
-const Spline = dynamic(() => import("@splinetool/react-spline"), { ssr: false });
 
 // fotos originalmente em pé (as deitadas têm faixas desfocadas após a padronização)
 const BG = [24, 66, 21, 71, 49, 62, 68, 74, 80, 9].map((n) => STOPS.find((s) => s.n === n)!.file);
@@ -29,10 +20,18 @@ export default function IdleScreen({ onStart }: { onStart: () => void }) {
   const [bg, setBg] = useState(0);
 
   useEffect(() => {
-    if (SPLINE_SCENE) return;
     const id = window.setInterval(() => setBg((i) => (i + 1) % BG.length), 5200);
     return () => window.clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    const next = new window.Image();
+    next.decoding = "async";
+    next.src = BG[(bg + 1) % BG.length];
+    return () => {
+      next.src = "";
+    };
+  }, [bg]);
 
   useGSAP(
     () => {
@@ -65,23 +64,9 @@ export default function IdleScreen({ onStart }: { onStart: () => void }) {
       className="absolute inset-0 z-[var(--z-idle)] flex flex-col overflow-hidden text-left text-white"
       style={{ background: "linear-gradient(160deg, #a8327f 0%, #d9206e 45%, #ee0a3c 100%)" }}
     >
-      {/* fundo: Spline (se houver) ou fotos reais do campus */}
+      {/* Uma foto por vez evita manter dez bitmaps e outra cena 3D na GPU. */}
       <div aria-hidden className="pointer-events-none absolute inset-0">
-        {SPLINE_SCENE ? (
-          <Spline scene={SPLINE_SCENE} className="h-full w-full" />
-        ) : (
-          BG.map((src, i) => (
-            <img
-              key={src}
-              data-bg={i}
-              src={src}
-              alt=""
-              className="absolute inset-0 h-full w-full object-cover transition-opacity duration-[1200ms]"
-              style={{ opacity: i === bg ? 1 : 0 }}
-              loading={i < 2 ? "eager" : "lazy"}
-            />
-          ))
-        )}
+        <img key={BG[bg]} data-bg={bg} src={BG[bg]} alt="" width={720} height={1280} decoding="async" className="absolute inset-0 h-full w-full object-cover" />
         <div className="absolute inset-0 bg-gradient-to-b from-[#8e1a6a]/85 via-[#c3105a]/55 to-[#120a10]/95 mix-blend-multiply" />
         <div className="absolute inset-0 bg-gradient-to-t from-[#120a10] via-[#120a10]/30 to-transparent" />
       </div>

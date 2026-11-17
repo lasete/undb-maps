@@ -57,20 +57,14 @@ const DAY: Look = {
   Cobertura_Laje: { color: "#c4bfb5" },
   Vidro: { color: "#6fb0ab" }, // verde-água das fotos da fachada
 };
-/** Tema escuro: paredes apagadas e janelas acesas (com bloom). */
+/**
+ * Tema escuro: as MESMAS cores do tema claro (paredes, lajes, letreiros); só
+ * as janelas acendem. Emissivo acima de 1 para só elas passarem do limiar do bloom.
+ */
 const NIGHT: Look = {
-  Parede_Branca: { color: "#3a2a34" },
-  Cobertura_Laje: { color: "#21161d" },
-  Rodape_Cinza: { color: "#160e13" },
-  Equipamentos: { color: "#4a3b45" },
-  Telha_Metalica: { color: "#3b3340" },
-  Caixilho: { color: "#0d080b" },
-  Vidro: { color: "#2a1d14", emissive: "#ffcf8a", intensity: 0.5 },
-  Vidro_Clinica: { color: "#14202a", emissive: "#cfe6ff", intensity: 0.4 },
-  Moldura_Cinza: { color: "#2c2530" },
-  UNDB_Vermelho: { color: "#7a0a1c", emissive: "#ff2a48", intensity: 0.25 },
-  Letreiro: { color: "#ffffff", emissive: "#ffffff", intensity: 0.9 },
-  Letreiro_Claro: { color: "#ffffff", emissive: "#ffffff", intensity: 0.9 },
+  ...DAY,
+  Vidro: { color: "#3b2c1c", emissive: "#ffcf8a", intensity: 1.15 }, // base escura: acende em âmbar, sem estourar
+  Vidro_Clinica: { emissive: "#dcecff", intensity: 1.1 },
 };
 
 /**
@@ -98,7 +92,6 @@ function cloneModel(src: THREE.Object3D, dark: boolean) {
       m.emissive.set(look.emissive);
       m.emissiveIntensity = look.intensity ?? 1;
     }
-    if (dark && m.name.startsWith("Faixa_")) m.color.multiplyScalar(0.7);
     m.userData.base = m.color.clone();
     m.userData.baseEmissive = m.emissiveIntensity;
     mesh.material = m;
@@ -817,11 +810,13 @@ export default function CampusScene(props: Props) {
       >
         <color attach="background" args={[t.bg]} />
         <fog attach="fog" args={[t.bg, 32, 80]} />
-        <hemisphereLight args={[dark ? "#5a4a8a" : "#fff8f0", dark ? "#120a10" : "#d9c9bf", dark ? 0.6 : 1.1]} />
+        {/* mesmas cores de parede nos dois temas; à noite a luz só fica um pouco
+            mais fraca e fria (nenhum custo extra de GPU: mesmas 2 luzes) */}
+        <hemisphereLight args={[dark ? "#e4e6f5" : "#fff8f0", dark ? "#b9aec0" : "#d9c9bf", dark ? 0.8 : 1.1]} />
         <directionalLight
           position={[-7, 12, 6]}
-          intensity={dark ? 0.9 : 2.2}
-          color={dark ? "#b9a8ff" : "#fff3e2"}
+          intensity={dark ? 1.55 : 2.2}
+          color={dark ? "#eae8ff" : "#fff3e2"}
           castShadow={quality.shadows}
           shadow-mapSize={[quality.shadowSize, quality.shadowSize]}
           shadow-camera-left={-10}
@@ -850,7 +845,7 @@ export default function CampusScene(props: Props) {
 
         {dark && quality.postprocessing && (
           <EffectComposer multisampling={0}>
-            <Bloom mipmapBlur intensity={0.7} luminanceThreshold={0.62} luminanceSmoothing={0.2} />
+            <Bloom mipmapBlur intensity={0.7} luminanceThreshold={1} luminanceSmoothing={0.1} />
             <Vignette offset={0.25} darkness={0.55} />
           </EffectComposer>
         )}

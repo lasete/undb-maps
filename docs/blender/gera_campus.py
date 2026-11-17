@@ -88,6 +88,7 @@ def hex_rgb(h):
 def mat(name, color, rough=0.8, metal=0.0, alpha=1.0, emit=None):
     m = bpy.data.materials.get(name) or bpy.data.materials.new(name)
     m.use_nodes = True
+    m.use_backface_culling = True  # exporta como face única (doubleSided: false)
     b = m.node_tree.nodes["Principled BSDF"]
     b.inputs["Base Color"].default_value = hex_rgb(color) if isinstance(color, str) else color
     b.inputs["Roughness"].default_value = rough
@@ -129,21 +130,35 @@ class Builder:
             self.mats.append(m)
         return self.mats.index(m)
 
-    def prism(self, pts, z0, z1, m_side, m_top=None, m_bottom=None):
+    def prism(self, pts, z0, z1, m_side, m_top=None, m_bottom=None, skip=(), top=True):
+        """Prisma OCO: só as faces que aparecem, todas viradas para fora (o .glb
+        sai com faces de um lado só e a GPU descarta o lado de dentro).
+        - a base é omitida quando encosta no chão (z0 = 0) ou com m_bottom=False
+        - `skip`: índices das laterais (aresta pts[i]→pts[i+1]) escondidas"""
+        n = len(pts)
+        area = sum(pts[i].x * pts[(i + 1) % n].y - pts[(i + 1) % n].x * pts[i].y for i in range(n))
+        out = area > 0  # anti-horário visto de cima → a ordem abaixo aponta para fora
         v0 = [self.bm.verts.new((p.x, p.y, z0)) for p in pts]
         v1 = [self.bm.verts.new((p.x, p.y, z1)) for p in pts]
-        n = len(pts)
         for i in range(n):
+            if i in skip:
+                continue
             j = (i + 1) % n
-            self.bm.faces.new((v0[i], v0[j], v1[j], v1[i])).material_index = self.mi(m_side)
-        self.bm.faces.new(v1).material_index = self.mi(m_top or m_side)
-        if m_bottom is not False:
-            self.bm.faces.new(v0[::-1]).material_index = self.mi(m_bottom or m_side)
+            f = (v0[i], v0[j], v1[j], v1[i]) if out else (v0[i], v1[i], v1[j], v0[j])
+            self.bm.faces.new(f).material_index = self.mi(m_side)
+        if top:
+            self.bm.faces.new(v1 if out else v1[::-1]).material_index = self.mi(m_top or m_side)
+        if m_bottom is not False and z0 > 0.001:
+            self.bm.faces.new(v0[::-1] if out else v0).material_index = self.mi(m_bottom or m_side)
+        for v in v0 + v1:  # vértices que ficaram sem face (base omitida etc.)
+            if not v.link_faces:
+                self.bm.verts.remove(v)
 
-    def box(self, a, t, n, s0, s1, d0, d1, z0, z1, m):
-        """caixa alinhada à aresta: t ao longo, n para fora"""
+    def box(self, a, t, n, s0, s1, d0, d1, z0, z1, m, back=True, top=True, bottom=True):
+        """caixa alinhada à aresta: t ao longo, n para fora.
+        back=False omite a face colada na parede (d0); top/bottom idem."""
         q = [a + t * s0 + n * d0, a + t * s1 + n * d0, a + t * s1 + n * d1, a + t * s0 + n * d1]
-        self.prism(q, z0, z1, m)
+        self.prism(q, z0, z1, m, m_bottom=None if bottom else False, skip=() if back else (0,), top=top)
 
     def add_mesh(self, me, xf, m):
         """copia um mesh (ex.: texto convertido) aplicando xf(co) -> Vector 3D"""
@@ -163,6 +178,8 @@ class Builder:
         cu.extrude = depth / 2
         cu.align_x = "CENTER"
         cu.align_y = "CENTER"
+        cu.resolution_u = 3  # curvas das letras: 3 segmentos bastam vistos de longe
+        cu.fill_mode = "FRONT"  # sem a tampa de trás, que fica colada na parede
         ob = bpy.data.objects.new("txt", cu)
         bpy.context.scene.collection.objects.link(ob)
         me = ob.evaluated_get(bpy.context.evaluated_depsgraph_get()).to_mesh()
@@ -193,7 +210,7 @@ class Builder:
             for k in range(seg):
                 j = (k + 1) % seg
                 f = (inner[k], outer[k], outer[j], inner[j])
-                self.bm.faces.new(f if sgn > 0 else f[::-1]).material_index = self.mi(m)
+                self.bm.faces.new(f[::-1] if sgn > 0 else f).material_index = self.mi(m)
             if sgn < 0:
                 front_in, front_out = inner, outer
             else:
@@ -205,7 +222,8 @@ class Builder:
 
     def to_object(self, name, parent=None):
         me = bpy.data.meshes.new(name)
-        bmesh.ops.recalc_face_normals(self.bm, faces=self.bm.faces)
+        # sem recalc_face_normals: as faces já nascem viradas para fora, e o
+        # recálculo erra em malhas abertas (o modelo é oco)
         self.bm.to_mesh(me)
         self.bm.free()
         for m in self.mats:
@@ -231,25 +249,25 @@ def building(b, M, parent):
         L = (c - a).length
         t = (c - a) / L
         nrm = Vector((t.y, -t.x))
-        bd.box(a, t, nrm, 0, L, -0.3, 0.05, h, h + PARAPET - 0.6, M["parede"])
-        bd.box(a, t, nrm, 0, L, -0.3, 0.08, h + PARAPET - 0.6, h + PARAPET, accent)
+        bd.box(a, t, nrm, 0, L, -0.3, 0.05, h, h + PARAPET - 0.6, M["parede"], bottom=False)
+        bd.box(a, t, nrm, 0, L, -0.3, 0.08, h + PARAPET - 0.6, h + PARAPET, accent, bottom=False)
         # rodapé cinza
-        bd.box(a, t, nrm, 0, L, 0, 0.04, 0, 0.6, M["rodape"])
+        bd.box(a, t, nrm, 0, L, 0, 0.04, 0, 0.6, M["rodape"], back=False, top=False)
         for f in range(b["floors"]):
             z = f * FLOOR_H
             if f:  # laje aparente entre pavimentos
-                bd.box(a, t, nrm, 0, L, 0, 0.35, z - 0.2, z + 0.15, M["parede"])
+                bd.box(a, t, nrm, 0, L, 0, 0.35, z - 0.2, z + 0.15, M["parede"], back=False)
             if L < 5:
                 continue
             # faixa de janelas com montantes a cada ~1,8 m
             inset = 1.2
             z0, z1 = z + 1.0, z + (2.9 if f else 3.1)
-            bd.box(a, t, nrm, inset, L - inset, 0.0, 0.06, z0, z1, M["vidro"])
+            bd.box(a, t, nrm, inset, L - inset, 0.0, 0.06, z0, z1, M["vidro"], back=False, top=False, bottom=False)
             k = max(1, round((L - 2 * inset) / 1.8))
             for j in range(k + 1):
                 s = inset + j * (L - 2 * inset) / k
-                bd.box(a, t, nrm, s - 0.06, s + 0.06, 0.0, 0.14, z0, z1, M["caixilho"])
-            bd.box(a, t, nrm, inset - 0.1, L - inset + 0.1, 0.0, 0.25, z0 - 0.12, z0, M["parede"])
+                bd.box(a, t, nrm, s - 0.06, s + 0.06, 0.0, 0.14, z0, z1, M["caixilho"], back=False, top=False, bottom=False)
+            bd.box(a, t, nrm, inset - 0.1, L - inset + 0.1, 0.0, 0.25, z0 - 0.12, z0, M["parede"], back=False)
 
     # condensadoras / caixas d'água na cobertura
     xs, ys = [p.x for p in pts], [p.y for p in pts]
@@ -299,7 +317,7 @@ def fachada_sul(bd, pts, h, M):
         s = 0.4 + j * (L - 0.8) / k
         bd.box(a, t, nrm, s - 0.3, s + 0.3, 0.4, 1.0, 0, FLOOR_H - 0.2, M["vermelho"])
     # marquise sobre a galeria do térreo
-    bd.box(a, t, nrm, 0, L, 0, 1.3, FLOOR_H - 0.2, FLOOR_H + 0.15, M["parede"])
+    bd.box(a, t, nrm, 0, L, 0, 1.3, FLOOR_H - 0.2, FLOOR_H + 0.15, M["parede"], back=False)
     mid = a + t * (L / 2)
     bd.text("CENTRO UNIVERSITÁRIO", mid, nrm, h - 0.35, 1.05, 0.12, M["letreiro"], off=0.02)
 
@@ -317,18 +335,18 @@ def clinicas(bd, M):
         L = (c - a).length
         t = (c - a) / L
         nrm = Vector((t.y, -t.x))
-        bd.box(a, t, nrm, 0, L, -0.3, 0.25, H, H + 0.9, M["moldura"])  # platibanda
+        bd.box(a, t, nrm, 0, L, -0.3, 0.25, H, H + 0.9, M["moldura"], bottom=False)  # platibanda
         south = nrm.y < -0.5
         g0 = 6.0 if south else 0.6  # na fachada sul, o painel cinza do letreiro
-        bd.box(a, t, nrm, g0, L - 0.6, 0.0, 0.08, 0.6, H - 0.4, M["vidro_clin"])
+        bd.box(a, t, nrm, g0, L - 0.6, 0.0, 0.08, 0.6, H - 0.4, M["vidro_clin"], back=False, top=False, bottom=False)
         k = max(1, round((L - 0.6 - g0) / 1.6))
         for j in range(k + 1):
             s = g0 + j * (L - 0.6 - g0) / k
-            bd.box(a, t, nrm, s - 0.05, s + 0.05, 0.0, 0.16, 0.6, H - 0.4, M["moldura"])
+            bd.box(a, t, nrm, s - 0.05, s + 0.05, 0.0, 0.16, 0.6, H - 0.4, M["moldura"], back=False, top=False, bottom=False)
         for f in range(1, floors):
-            bd.box(a, t, nrm, g0, L - 0.6, 0.0, 0.18, f * FLOOR_H - 0.12, f * FLOOR_H + 0.12, M["moldura"])
+            bd.box(a, t, nrm, g0, L - 0.6, 0.0, 0.18, f * FLOOR_H - 0.12, f * FLOOR_H + 0.12, M["moldura"], back=False)
         if south:
-            bd.box(a, t, nrm, 0.0, 5.6, 0.0, 0.3, 0.0, H + 0.9, M["moldura"])
+            bd.box(a, t, nrm, 0.0, 5.6, 0.0, 0.3, 0.0, H + 0.9, M["moldura"], back=False)
             bd.text("UNDB", a + t * 2.8, nrm, H - 2.0, 1.25, 0.1, M["letreiro_claro"], off=0.3)
             bd.text("CLÍNICAS", a + t * 2.8, nrm, H - 4.0, 0.62, 0.06, M["letreiro_claro"], off=0.3)
             bd.text("INTEGRADAS", a + t * 2.8, nrm, H - 4.8, 0.62, 0.06, M["letreiro_claro"], off=0.3)
@@ -346,7 +364,7 @@ def area(a, M, parent):
         p0, p1 = pts[i], pts[(i + 1) % n]
         L = (p1 - p0).length
         t = (p1 - p0) / L
-        bd.box(p0, t, Vector((t.y, -t.x)), 0, L, 0, 0.04, 0, 0.6, M["rodape"])
+        bd.box(p0, t, Vector((t.y, -t.x)), 0, L, 0, 0.04, 0, 0.6, M["rodape"], back=False, top=False)
     ob = bd.to_object(f"Area_{a['id']}", parent)
     ob["area_id"] = a["id"]
     ob["nome"] = a["name"]
@@ -470,7 +488,8 @@ def main():
         export_lights=False,
         use_selection=True,
     )
-    print("OK", [b["id"] for b in blds], out_glb)
+    tris = sum(sum(len(p.vertices) - 2 for p in ob.data.polygons) for ob in scene.objects if ob.type == "MESH" and ob is not chao)
+    print("OK", [b["id"] for b in blds], out_glb, f"{tris} triângulos")
 
     if RENDER:
         scene.render.filepath = os.path.join(REPO, "docs/blender/preview.png")

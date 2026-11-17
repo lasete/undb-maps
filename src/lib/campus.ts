@@ -80,7 +80,8 @@ export const BUILDINGS: Building[] = [
     color: "#4600A6",
     ink: "#FFFFFF",
     poly: [[992, 459], [1488, 459], [1488, 571], [992, 571]],
-    floors: 2,
+    // Street View (mai/2024): térreo com pilares vermelhos + 2 faixas de janelas
+    floors: 3,
     series: ["300", "400"],
   },
   {

@@ -6,11 +6,15 @@
  * entre a vista de cima e a inclinada. Os prédios são extrudados a partir do
  * CONTORNO REAL (mapa da equipe sobre o satélite), com o telhado recortado da
  * própria imagem. Coordenadas = pixels da imagem (1 unidade = 100 px ≈ 14,9 m).
+ *
+ * Quando /campus/campus-undb.glb carrega (gerado no Blender por
+ * docs/blender/gera_campus.py a partir dos mesmos contornos), os prédios usam
+ * esse modelo; se ele falhar, a cena volta para as fachadas procedurais.
  */
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
-import { Html, Line, OrbitControls, useTexture } from "@react-three/drei";
+import { Html, Line, OrbitControls, useGLTF, useTexture } from "@react-three/drei";
 import { Bloom, EffectComposer, Vignette } from "@react-three/postprocessing";
-import { Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Component, Suspense, useLayoutEffect, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import gsap from "gsap";
 import * as THREE from "three";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
@@ -32,6 +36,76 @@ const M = 1 / (100 * MAP.metersPerPx); // metros → unidades
 // vertical de 1,6× para os volumes ficarem legíveis de longe (comum em mapas 3D)
 const EXAG = 1.6;
 const FLOOR_H = 3.8 * M * EXAG;
+
+/* ------------------------------------------------------- modelo do Blender */
+
+const MODEL_URL = "/campus/campus-undb.glb";
+/** escala do modelo (metros, Y para cima): mesma conta dos volumes procedurais */
+const MODEL_SCALE: [number, number, number] = [M, M * EXAG, M];
+const PARAPET_H = 1.0 * M * EXAG; // platibanda do modelo acima da última laje
+const GARAGE_H = 3.2 * M * EXAG;
+
+interface CampusModel {
+  buildings: Partial<Record<BuildingId, THREE.Object3D>>;
+  garage?: THREE.Object3D;
+  gate?: THREE.Object3D;
+}
+
+type Look = Record<string, { color?: string; emissive?: string; intensity?: number }>;
+/** Tema claro: laje e vidro um pouco mais claros para a cobertura não "sumir" no satélite. */
+const DAY: Look = {
+  Cobertura_Laje: { color: "#c4bfb5" },
+  Vidro: { color: "#6fb0ab" }, // verde-água das fotos da fachada
+};
+/** Tema escuro: paredes apagadas e janelas acesas (com bloom). */
+const NIGHT: Look = {
+  Parede_Branca: { color: "#3a2a34" },
+  Cobertura_Laje: { color: "#21161d" },
+  Rodape_Cinza: { color: "#160e13" },
+  Equipamentos: { color: "#4a3b45" },
+  Telha_Metalica: { color: "#3b3340" },
+  Caixilho: { color: "#0d080b" },
+  Vidro: { color: "#2a1d14", emissive: "#ffcf8a", intensity: 0.5 },
+  Vidro_Clinica: { color: "#14202a", emissive: "#cfe6ff", intensity: 0.4 },
+  Moldura_Cinza: { color: "#2c2530" },
+  UNDB_Vermelho: { color: "#7a0a1c", emissive: "#ff2a48", intensity: 0.25 },
+  Letreiro: { color: "#ffffff", emissive: "#ffffff", intensity: 0.9 },
+  Letreiro_Claro: { color: "#ffffff", emissive: "#ffffff", intensity: 0.9 },
+};
+
+/**
+ * Clona um nó do GLB com materiais próprios (cada prédio escurece sozinho).
+ * Guarda a cor original em userData.base para o efeito de "dimmed".
+ */
+function cloneModel(src: THREE.Object3D, dark: boolean) {
+  const obj = src.clone(true);
+  obj.position.set(0, 0, 0);
+  const mats: THREE.MeshStandardMaterial[] = [];
+  obj.traverse((o) => {
+    const mesh = o as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    const m = (mesh.material as THREE.MeshStandardMaterial).clone();
+    // sem mapa de ambiente, vidro metálico reflete "preto": deixa fosco
+    if (m.name.startsWith("Vidro")) {
+      m.metalness = 0.05;
+      m.roughness = 0.35;
+    }
+    const look = (dark ? NIGHT : DAY)[m.name];
+    if (look?.color) m.color.set(look.color);
+    if (look?.emissive) {
+      m.emissive.set(look.emissive);
+      m.emissiveIntensity = look.intensity ?? 1;
+    }
+    if (dark && m.name.startsWith("Faixa_")) m.color.multiplyScalar(0.7);
+    m.userData.base = m.color.clone();
+    m.userData.baseEmissive = m.emissiveIntensity;
+    mesh.material = m;
+    mats.push(m);
+  });
+  return { obj, mats };
+}
 
 const THEME = {
   dark: { bg: "#120a10", ground: "#8a7883", wall: "#2b1c26", wallLine: "#3d2a36", street: "#0c0609", window: "#130a10", lit: "#ffcf8a", ghost: "#9a8a94" },
@@ -187,7 +261,14 @@ function Ground({ view, dark, sat, shadows }: { view: SceneView; dark: boolean; 
 
 /* ---------------------------------------------- garagem e Colégio Dom Bosco */
 
-function Areas({ dark }: { dark: boolean }) {
+/** Peça fixa do modelo (garagem, portão), sem interação. */
+function ModelPiece({ src, dark }: { src: THREE.Object3D; dark: boolean }) {
+  const piece = useMemo(() => cloneModel(src, dark), [src, dark]);
+  useEffect(() => () => piece.mats.forEach((m) => m.dispose()), [piece]);
+  return <primitive object={piece.obj} scale={MODEL_SCALE} />;
+}
+
+function Areas({ dark, garage }: { dark: boolean; garage?: THREE.Object3D }) {
   const t = dark ? THEME.dark : THEME.light;
   return (
     <group>
@@ -204,7 +285,8 @@ function Areas({ dark }: { dark: boolean }) {
                 <meshBasicMaterial color="#ff9a1f" transparent opacity={dark ? 0.22 : 0.28} depthWrite={false} toneMapped={false} />
               </mesh>
               <Line points={outline} color="#ff9a1f" lineWidth={2} dashed dashSize={0.1} gapSize={0.07} />
-              <Html position={[X(cx), 0.05, Z(cy)]} center zIndexRange={[15, 0]} style={{ pointerEvents: "none" }}>
+              {garage && a.id === "garagem" && <ModelPiece src={garage} dark={dark} />}
+              <Html position={[X(cx), garage && a.id === "garagem" ? GARAGE_H + 0.12 : 0.05, Z(cy)]} center zIndexRange={[15, 0]} style={{ pointerEvents: "none" }}>
                 <span className="rounded-full bg-[#ff9a1f] px-2 py-0.5 font-display text-[10px] font-bold whitespace-nowrap text-[#1b0d17] shadow">{a.name}</span>
               </Html>
             </group>
@@ -245,11 +327,13 @@ interface BuildingProps {
   roofSat: THREE.Texture;
   haloTex: THREE.Texture;
   shadows: boolean;
+  model?: THREE.Object3D;
   onSelect: (id: BuildingId) => void;
 }
 
-function Building({ b, selected, dimmed, dark, stats, index, facade, roofSat, haloTex, shadows, onSelect }: BuildingProps) {
+function Building({ b, selected, dimmed, dark, stats, index, facade, roofSat, haloTex, shadows, model, onSelect }: BuildingProps) {
   const h = b.floors * FLOOR_H;
+  const top = h + (model ? PARAPET_H : 0);
   const group = useRef<THREE.Group>(null);
   const halo = useRef<THREE.MeshBasicMaterial>(null);
   const [hover, setHover] = useState(false);
@@ -257,7 +341,10 @@ function Building({ b, selected, dimmed, dark, stats, index, facade, roofSat, ha
   const box = bbox(b.poly);
   const [cx, cy] = centroid(b.poly);
 
+  const modelClone = useMemo(() => (model ? cloneModel(model, dark) : null), [model, dark]);
+
   const { walls, wallMat, roofMat, roofShape } = useMemo(() => {
+    if (modelClone) return { walls: [], wallMat: undefined, roofMat: undefined, roofShape: undefined };
     const walls = b.poly.map(([ax, ay], i) => {
       const [bx, by] = b.poly[(i + 1) % b.poly.length];
       const A = new THREE.Vector2(X(ax), Z(ay));
@@ -279,15 +366,17 @@ function Building({ b, selected, dimmed, dark, stats, index, facade, roofSat, ha
     });
     const roofMat = new THREE.MeshBasicMaterial({ map: roofSat, color: dark ? "#c2b0ba" : "#ffffff", toneMapped: false });
     return { walls, wallMat, roofMat, roofShape: shapeOf(b.poly) };
-  }, [b, dark, facade, h, roofSat]);
+  }, [b, dark, facade, h, roofSat, modelClone]);
 
   useEffect(
     () => () => {
-      wallMat.dispose();
-      roofMat.dispose();
+      wallMat?.dispose();
+      roofMat?.dispose();
     },
     [roofMat, wallMat],
   );
+
+  useEffect(() => () => modelClone?.mats.forEach((m) => m.dispose()), [modelClone]);
 
   // entrada: os prédios "crescem" do chão
   useEffect(() => {
@@ -309,15 +398,26 @@ function Building({ b, selected, dimmed, dark, stats, index, facade, roofSat, ha
   // não selecionados escurecem (sem transparência, para não "vazar" o halo)
   useEffect(() => {
     const k = dimmed ? 0.45 : 1;
-    const roofBase = new THREE.Color(dark ? "#c2b0ba" : "#ffffff");
-    const tweens = [
-      gsap.to(wallMat.color, { r: k, g: k, b: k, duration: 0.45, onUpdate: invalidate }),
-      gsap.to(roofMat.color, { r: roofBase.r * k, g: roofBase.g * k, b: roofBase.b * k, duration: 0.45, onUpdate: invalidate }),
-    ];
+    const tweens: gsap.core.Tween[] = [];
+    if (modelClone) {
+      for (const m of modelClone.mats) {
+        const base = m.userData.base as THREE.Color;
+        tweens.push(gsap.to(m.color, { r: base.r * k, g: base.g * k, b: base.b * k, duration: 0.45, onUpdate: invalidate }));
+        // janelas acesas do modelo também apagam
+        const ei = m.userData.baseEmissive as number | undefined;
+        if (ei) tweens.push(gsap.to(m, { emissiveIntensity: ei * (dimmed ? 0.3 : 1), duration: 0.45, onUpdate: invalidate }));
+      }
+    } else if (wallMat && roofMat) {
+      const roofBase = new THREE.Color(dark ? "#c2b0ba" : "#ffffff");
+      tweens.push(
+        gsap.to(wallMat.color, { r: k, g: k, b: k, duration: 0.45, onUpdate: invalidate }),
+        gsap.to(roofMat.color, { r: roofBase.r * k, g: roofBase.g * k, b: roofBase.b * k, duration: 0.45, onUpdate: invalidate }),
+      );
+    }
     return () => tweens.forEach((tween) => tween.kill());
-  }, [dark, dimmed, invalidate, roofMat, wallMat]);
+  }, [dark, dimmed, invalidate, modelClone, roofMat, wallMat]);
 
-  const edge = [...b.poly, b.poly[0]].map(([x, y]) => [X(x), h + 0.025, Z(y)] as [number, number, number]);
+  const edge = [...b.poly, b.poly[0]].map(([x, y]) => [X(x), top + 0.025, Z(y)] as [number, number, number]);
   const pointer = {
     onClick: (e: { stopPropagation: () => void }) => {
       e.stopPropagation();
@@ -343,20 +443,28 @@ function Building({ b, selected, dimmed, dark, stats, index, facade, roofSat, ha
       </mesh>
 
       <group ref={group}>
+        {modelClone && (
+          // o modelo já tem a faixa na cor do prédio: o contorno só aparece em destaque
+          <group {...pointer}>
+            <primitive object={modelClone.obj} scale={MODEL_SCALE} />
+          </group>
+        )}
         {walls.map((w, i) => (
           <mesh key={i} position={w.mid} rotation-y={w.rotY} material={wallMat} castShadow={shadows} {...pointer}>
             <FacadeGeometry len={w.len} height={h} floors={b.floors} />
           </mesh>
         ))}
-        <mesh rotation-x={-Math.PI / 2} position-y={h} material={roofMat} castShadow={shadows} {...pointer}>
-          <shapeGeometry args={[roofShape]} />
-        </mesh>
+        {roofMat && roofShape && (
+          <mesh rotation-x={-Math.PI / 2} position-y={h} material={roofMat} castShadow={shadows} {...pointer}>
+            <shapeGeometry args={[roofShape]} />
+          </mesh>
+        )}
         {/* platibanda na cor do prédio */}
-        <Line points={edge} color={b.color} lineWidth={selected ? 5 : 3} toneMapped={false} />
+        {(!model || selected || hover) && <Line points={edge} color={b.color} lineWidth={selected ? 5 : 3} toneMapped={false} />}
       </group>
 
       {/* pino */}
-      <Html position={[X(cx), h + 0.3, Z(cy)]} center zIndexRange={[20, 0]}>
+      <Html position={[X(cx), top + (model ? 0.4 : 0.3), Z(cy)]} center zIndexRange={[20, 0]}>
         <button
           data-pin
           onClick={() => onSelect(b.id)}
@@ -561,7 +669,8 @@ function World({
   dark,
   onSelect,
   quality,
-}: Omit<Props, "onBackground"> & { quality: SceneQuality }) {
+  model,
+}: Omit<Props, "onBackground"> & { quality: SceneQuality; model?: CampusModel }) {
   const sat = useTexture(dark ? "/campus/satelite-noite.jpg" : "/campus/satelite-dia.jpg", (texture) => {
     texture.colorSpace = THREE.SRGBColorSpace;
     texture.anisotropy = quality.name === "economy" ? 2 : 4;
@@ -583,7 +692,8 @@ function World({
   return (
     <>
       <Ground view={view} dark={dark} sat={sat} shadows={quality.shadows} />
-      <Areas dark={dark} />
+      <Areas dark={dark} garage={model?.garage} />
+      {model?.gate && <ModelPiece src={model.gate} dark={dark} />}
       {BUILDINGS.map((b, i) => (
         <Building
           key={b.id}
@@ -597,6 +707,7 @@ function World({
           roofSat={roofSat}
           haloTex={haloTex}
           shadows={quality.shadows}
+          model={model?.buildings[b.id]}
           onSelect={onSelect}
         />
       ))}
@@ -604,6 +715,31 @@ function World({
       <Here x={layout.gate.x} y={layout.gate.y} label={hereLabel} />
     </>
   );
+}
+
+/** Mundo com o modelo do Blender; os nós vêm pelo nome dado em gera_campus.py. */
+function ModelWorld(props: Omit<Props, "onBackground"> & { quality: SceneQuality }) {
+  const { nodes } = useGLTF(MODEL_URL);
+  const model = useMemo<CampusModel>(() => {
+    const buildings: CampusModel["buildings"] = {};
+    for (const b of BUILDINGS) if (nodes[`Predio_${b.id}`]) buildings[b.id] = nodes[`Predio_${b.id}`];
+    return { buildings, garage: nodes.Area_garagem, gate: nodes.Portao_Entrada };
+  }, [nodes]);
+  return <World {...props} model={model} />;
+}
+
+/** Se o .glb não baixar (rede ruim, 404), mostra os prédios procedurais em vez de derrubar a cena. */
+class ModelBoundary extends Component<{ fallback: ReactNode; children: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+  componentDidCatch(err: unknown) {
+    console.warn("[CampusScene] modelo 3D indisponível, usando volumes procedurais", err);
+  }
+  render() {
+    return this.state.failed ? this.props.fallback : this.props.children;
+  }
 }
 
 /* Objetos do renderer Three.js são externos ao React e configurados imperativamente. */
@@ -695,9 +831,17 @@ export default function CampusScene(props: Props) {
           shadow-bias={-0.0004}
         />
 
-        <Suspense fallback={null}>
-          <World {...props} quality={quality} />
-        </Suspense>
+        <ModelBoundary
+          fallback={
+            <Suspense fallback={null}>
+              <World {...props} quality={quality} />
+            </Suspense>
+          }
+        >
+          <Suspense fallback={null}>
+            <ModelWorld {...props} quality={quality} />
+          </Suspense>
+        </ModelBoundary>
 
         <OrbitControls makeDefault enableDamping dampingFactor={0.08} minDistance={2.5} maxDistance={32} screenSpacePanning />
         <Rig view={view} focus={selected} route={route} intro={quality.animateIntro} />
